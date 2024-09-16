@@ -17,6 +17,8 @@ import random, logging, logging.handlers, threading, queue, time, contextlib, ma
 from extras.mmu_toolhead import MmuToolHead, MmuHoming
 from extras.homing import Homing, HomingMove
 from extras.mmu_leds import MmuLeds
+from extras.mmu_sensors import SyncTensionSensorAdj
+
 import chelper, ast
 
 
@@ -207,9 +209,7 @@ class Mmu:
     SYNC_FEEDBACK_INTERVAL  = 0.5   # How often to check extruder direction
     SYNC_POSITION_TIMERANGE = 0.6   # Interval to compare movement
     SYNC_POSITION_MIN_DELTA = 0.001 # Min extruder move distance to be significant
-    SYNC_STATE_NEUTRAL = 0
-    SYNC_STATE_COMPRESSED = 1.
-    SYNC_STATE_EXPANDED = -1.
+
 
     # Vendor MMU's supported
     VENDOR_ERCF     = "ERCF"
@@ -559,6 +559,16 @@ class Mmu:
         self.sync_multiplier_high = config.getfloat('sync_multiplier_high', 1.05, minval=1., maxval=2.)
         self.sync_multiplier_low = config.getfloat('sync_multipler_low', 0.95, minval=0.5, maxval=1.)
         self.sync_feedback_enable = config.getint('sync_feedback_enable', 0, minval=0, maxval=1)
+
+        # must have two tension sensors for expanded and compressed, otherwise it's impossible to work.
+        sync_tension_auto_adjust_rotation_dist = config.getint('sync_tension_auto_adjust_rotation_dist', 0, minval=0, maxval=1)
+        if sync_tension_auto_adjust_rotation_dist:
+            self.sync_tension_sensor_adj = SyncTensionSensorAdj()
+            # reuse the main logger
+            self.sync_tension_sensor_adj.set_logger(self.log_debug, self.log_always, self.log_error)
+        else:
+            self.sync_tension_sensor_adj = None
+
 
         # Servo control
         self.servo_angles = {}
@@ -1114,6 +1124,7 @@ class Mmu:
             led_vars['led_enable'] = variables.get('led_enable', True) & self.has_leds
             led_vars['led_animation'] = variables.get('led_animation', True) & self.has_led_animation
             led_vars_macro.variables.update(led_vars)
+
 
         self.estimated_print_time = self.printer.lookup_object('mcu').estimated_print_time
 
@@ -3203,10 +3214,22 @@ class Mmu:
     # or can be a proportional float value between -1.0 and 1.0
     def _handle_sync_feedback(self, eventtime, state):
         self.log_trace("Got sync force feedback update. State: %s" % state)
+
         if abs(state) <= 1:
-            self.sync_feedback_last_state = float(state)
-            if self.sync_feedback_enable and self.sync_feedback_operational:
+            # only do advance auto adjust rotation_dist when it's enabled.
+            if self.sync_tension_sensor_adj and self._is_printing():
+                new_rota_dist = self.sync_tension_sensor_adj.get_rotation_dist_on_state_change( \
+                    self.sync_feedback_last_state, state)
+                self.set_gate_rotation_dist(new_rota_dist)
+                # dont set last state before calling get_rotation_dist_on_state_change()
+                self.sync_feedback_last_state = float(state)
+                # once it's done, stop here, do not go further for normal sync multiplier type processing.
+                return
+            else:
+                self.sync_feedback_last_state = float(state)
                 self._update_sync_multiplier()
+        else:
+            self.log_error(f"_handle_sync_feedback() has invalid tension state {state}! why??")
 
     def _handle_mmu_synced(self):
         self.log_info("Synced MMU to extruder%s" % (" (sync feedback activated)" if self.sync_feedback_enable else ""))
@@ -3222,7 +3245,7 @@ class Mmu:
             # Disable sync feedback
             self.reactor.update_timer(self.sync_feedback_timer, self.reactor.NEVER)
             self.sync_feedback_operational = False
-            self.sync_feedback_last_direction = self.SYNC_STATE_NEUTRAL
+            self.sync_feedback_last_direction = SyncTensionSensorAdj.SYNC_STATE_NEUTRAL
             self.log_trace("Reset sync multiplier")
             self._set_gate_ratio(self._get_gate_ratio(self.gate_selected))
 
@@ -3241,8 +3264,40 @@ class Mmu:
         return eventtime + self.SYNC_FEEDBACK_INTERVAL
 
     def _update_sync_multiplier(self):
-        if not self.sync_feedback_enable or not self.sync_feedback_operational: return
-        if self.sync_feedback_last_direction == self.SYNC_STATE_NEUTRAL:
+
+        if self.sync_tension_sensor_adj and self._is_printing():
+            # note ,must not check direction_load , when printing , maybe 30-50% of the time it's retracting a bit. the chance is very high,
+            # but the distance /length is small
+            #self.log_info("_update_sync_multiplier working is_printing")
+
+            # auto adjust rotation_dist ONLY when
+            #    * this feaature is enabled - for obviously reason
+            #    * is printing - when not printing, really not much meaning to adjust rotation dist, loading / unloading filament shouldn't matter much
+            #    * direction ignore: when printing, most distance's direction is load, very little is unload only when retracting. unload's distance is cancelled by load.
+            #                         therefore can be ignored. to make thing much easier.
+
+            if not self.sync_feedback_enable or not self.sync_feedback_operational:
+                return
+            if self.sync_feedback_last_direction == self.DIRECTION_UNKNOWN:
+                # 0 = unknown not running, just ignore
+                return
+
+            #if self.sync_feedback_last_direction == self.DIRECTION_UNLOAD:
+                # ignore when retract since usually retract(printing) is very very small distance! don't let it mess up the sync ratio.
+            #    return
+
+            rotation_distance = self.sync_tension_sensor_adj.update_sync_rotation_dist(self.sync_feedback_last_state)
+            if rotation_distance:
+
+            #if not math.isclose(self.sync_tension_sensor_adj.current_rotation_dist, rotation_distance):
+                # if it's the same value, don't set it again and again
+                self.set_gate_rotation_dist(rotation_distance)
+                #self.sync_tension_sensor_adj.current_rotation_dist = rotation_distance
+            return
+        # end of if sync_tension_sensor_adj
+        #################################################################
+
+        if self.sync_feedback_last_direction == SyncTensionSensorAdj.SYNC_STATE_NEUTRAL:
             multiplier = 1.
         else:
             go_slower = lambda s, d: abs(s - d) < abs(s + d)
@@ -3259,23 +3314,41 @@ class Mmu:
     def _update_sync_starting_state(self):
         if not self.mmu_sensors: return
         eventtime = self.reactor.monotonic()
-        sss = self.SYNC_STATE_NEUTRAL
-
+        sss = SyncTensionSensorAdj.SYNC_STATE_NEUTRAL
+        has_both_sensors = False
         if self.mmu_sensors.has_tension_switch and not self.mmu_sensors.has_compression_switch:
-            sss = self.SYNC_STATE_EXPANDED if self.mmu_sensors.get_status(eventtime)[self.SWITCH_SYNC_FEEDBACK_TENSION] else self.SYNC_STATE_COMPRESSED
+            sss = SyncTensionSensorAdj.SYNC_STATE_EXPANDED if self.mmu_sensors.get_status(eventtime)[self.SWITCH_SYNC_FEEDBACK_TENSION] else SyncTensionSensorAdj.SYNC_STATE_COMPRESSED
         elif self.mmu_sensors.has_compression_switch and not self.mmu_sensors.has_tension_switch:
-            sss = self.SYNC_STATE_COMPRESSED if self.mmu_sensors.get_status(eventtime)[self.SWITCH_SYNC_FEEDBACK_COMPRESSION] else self.SYNC_STATE_EXPANDED
+            sss = SyncTensionSensorAdj.SYNC_STATE_COMPRESSED if self.mmu_sensors.get_status(eventtime)[self.SWITCH_SYNC_FEEDBACK_COMPRESSION] else SyncTensionSensorAdj.SYNC_STATE_EXPANDED
         elif self.mmu_sensors.has_compression_switch and self.mmu_sensors.has_tension_switch:
+            has_both_sensors = True
             state_expanded = self.mmu_sensors.get_status(eventtime)[self.SWITCH_SYNC_FEEDBACK_TENSION]
             state_compressed = self.mmu_sensors.get_status(eventtime)[self.SWITCH_SYNC_FEEDBACK_COMPRESSION]
             if state_expanded and state_compressed:
                 self.log_error("Both expanded and compressed sync feedback sensors are triggered at the same time. Check hardware!")
             elif state_expanded:
-                sss = self.SYNC_STATE_EXPANDED
+                sss = SyncTensionSensorAdj.SYNC_STATE_EXPANDED
             elif state_compressed:
-                sss = self.SYNC_STATE_COMPRESSED
+                sss = SyncTensionSensorAdj.SYNC_STATE_COMPRESSED
             else:
                 pass # Assume neutral
+
+       # adjusting the sync_auto_adjust_rotation_dist_enabled setting based on hw/sw config
+        # can only enable the advance auto adjust rotation_dist feature when we have both expanded and compressed sensor.
+        # and only when user enable it in config
+        if not self.sync_feedback_enable:
+            self.log_debug("disabling sync_auto_adjust_rotation_dist since the whole sync feedback feature is disabled")
+            self.sync_tension_sensor_adj = None
+        elif not has_both_sensors:
+            if self.sync_tension_sensor_adj:
+                self.log_always(
+                "even though user enabled sync_auto_adjust_rotation_dist but since the system doesn't have two sensors for sync tension, disabling it")
+            #SyncTensionSensorAdj.set_auto_adjust_feature_enable(False)
+            self.sync_tension_sensor_adj = None
+        else:
+            if self.sync_tension_sensor_adj:
+                self.log_debug(f"has both tension sensors, and tension sensor handler is ready")
+                self.sync_tension_sensor_adj.init_for_next_print(self.ref_gear_rotation_distance)
 
         self._handle_sync_feedback(eventtime, sss)
         self.log_trace("Set initial sync feedback state to: %s" % self._get_sync_feedback_string())
@@ -5963,6 +6036,12 @@ class Mmu:
         if tool != self.tool_selected:
             self.tool_selected = tool
             self._save_variable(self.VARS_MMU_TOOL_SELECTED, self.tool_selected, write=True)
+
+    def set_gate_rotation_dist(self, rota_dist):
+        # nice to let user know what is the actual rotation_dist set to gear stepper motor,
+        # don't hide it, besides, this log doesn't show a lot as the tension state doesn't change a lot.
+        self.log_always(f"set_gate_rotation_dist() setting gear motor rotation distance: {rota_dist:.6f}")
+        self.gear_stepper.set_rotation_distance(rota_dist)
 
     def _set_gate_ratio(self, ratio=1.):
         new_rotation_distance = ratio * self.ref_gear_rotation_distance
